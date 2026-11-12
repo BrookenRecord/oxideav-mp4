@@ -6985,6 +6985,12 @@ pub struct SampleEntry<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SampleInfo {
+    /// Zero-based expansion ordinal across all tracks in this reader's finite
+    /// input. Unique within this reader and unchanged by byte-offset sorting or
+    /// packet reads; unrelated to timestamps or fragment sequence numbers. A new
+    /// reader/window starts its own ordinal space. Matches fragment group ranges
+    /// in [`TrafSampleGroupRecord`] together with the selected stream index.
+    pub ordinal: u64,
     /// Absolute file offset of the sample's first byte.
     pub offset: u64,
     /// Sample size in bytes.
@@ -10554,21 +10560,31 @@ pub struct MoofPsshRecord {
 /// `sgpd` or the `trak`-level (global) one. The `csgp` bit-7
 /// `index_msb_indicates_fragment_local_description` flag exists precisely
 /// for this `traf` case (§8.9.5: "legal only inside a `traf`"). The
-/// demuxer collects each `traf`'s sample-group boxes verbatim, keyed by
-/// `(track_idx, moof_sequence)`, so a downstream layer can resolve
-/// per-fragment grouping (most commonly CENC `seig` key rotation across
-/// a fragment's samples) without re-walking the file. The bytes are not
+/// demuxer collects each `traf`'s sample-group boxes verbatim. Associate
+/// samples by `track_idx` and the half-open expansion-ordinal range
+/// `[first_sample_ordinal, first_sample_ordinal + sample_count)` within
+/// this reader. The `moof_sequence` is descriptive and may repeat; it
+/// does not establish sample membership. The bytes are not
 /// interpreted here — the parsed `SampleToGroup` / `CompactSampleToGroup`
 /// / `SampleGroupDescription` records preserve their on-wire values and
 /// the grouping-type semantics belong to the caller (mirroring the
 /// `stbl`-level surface).
 #[derive(Clone, Debug)]
 pub struct TrafSampleGroupRecord {
+    /// First expansion ordinal of the samples actually emitted by this `traf`.
+    /// With `sample_count`, forms a half-open range in [`SampleInfo::ordinal`]
+    /// within this reader. Match `track_idx` as well; timestamps and
+    /// `moof_sequence` do not establish membership. An empty range matches none.
+    pub first_sample_ordinal: u64,
+    /// Actual emitted samples in this `traf`, across all its runs. The checked
+    /// end is `first_sample_ordinal + sample_count`; not a declared group count.
+    /// A group-bearing `traf` with no emitted samples has count zero.
+    pub sample_count: u64,
     /// `track_idx` of the matching stream in the demuxer's `streams()`
     /// list (0-based).
     pub track_idx: u32,
-    /// `mfhd.sequence_number` of the enclosing `moof`. Surfaced so a
-    /// caller replaying out of order can re-key.
+    /// Descriptive `mfhd.sequence_number` of the enclosing `moof`. May repeat;
+    /// use the track and expansion-ordinal range for sample association.
     pub moof_sequence: u32,
     /// Fragment-local `sgpd` (SampleGroupDescriptionBox §8.9.3)
     /// descriptions, in `traf` order. These shadow the `trak`-level
@@ -11139,19 +11155,9 @@ fn parse_traf(
         });
     }
 
-    // §8.9 — record this traf's fragment-local sample-group boxes (if
-    // any) keyed by `(track_idx, moof_sequence)`, so a downstream layer
-    // can resolve per-fragment grouping (e.g. CENC `seig` key rotation)
-    // without re-walking the file.
-    if !frag_sgpd.is_empty() || !frag_sbgp.is_empty() || !frag_csgp.is_empty() {
-        traf_sample_groups.push(TrafSampleGroupRecord {
-            track_idx: state.track_idx as u32,
-            moof_sequence,
-            sgpd: frag_sgpd,
-            sbgp: frag_sbgp,
-            csgp: frag_csgp,
-        });
-    }
+    let sample_start = samples.len();
+    let first_sample_ordinal =
+        u64::try_from(sample_start).map_err(|_| Error::invalid("MP4: sample ordinal overflow"))?;
 
     // Each trun walks samples from its own data_offset relative to
     // base_data_offset. Track running data offset across multiple
@@ -11255,6 +11261,25 @@ fn parse_traf(
                 .ok_or_else(|| Error::invalid("MP4: decode timestamp overflow"))?;
         }
         next_data_offset_within_traf = sample_off;
+    }
+
+    // Capture actual append ownership before the global byte-offset sort.
+    // samples() restores these unique ordinals, independent of DTS or mfhd.
+    let sample_count = u64::try_from(samples.len() - sample_start)
+        .map_err(|_| Error::invalid("MP4: sample count overflow"))?;
+    first_sample_ordinal
+        .checked_add(sample_count)
+        .ok_or_else(|| Error::invalid("MP4: sample ordinal range overflow"))?;
+    if !frag_sgpd.is_empty() || !frag_sbgp.is_empty() || !frag_csgp.is_empty() {
+        traf_sample_groups.push(TrafSampleGroupRecord {
+            first_sample_ordinal,
+            sample_count,
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            sgpd: frag_sgpd,
+            sbgp: frag_sbgp,
+            csgp: frag_csgp,
+        });
     }
 
     next_dts[state.track_idx] = frag_dts;
@@ -14581,7 +14606,9 @@ impl Mp4Demuxer {
     /// and the containing `mfhd.sequence_number` via `moof_sequence`; the
     /// parsed boxes preserve their on-wire values verbatim (grouping-type
     /// semantics belong to the caller, mirroring the `stbl`-level
-    /// surface). Most commonly populated for CENC `seig` key rotation
+    /// surface). Match a sample by `track_idx` and the record's half-open
+    /// expansion-ordinal range, not by sequence number or timestamps. Most
+    /// commonly populated for CENC `seig` key rotation
     /// across a fragment's samples. Empty in non-fragmented files and in
     /// fragmented files carrying sample groups only at `trak`/`stbl`
     /// level (the common case).
@@ -14852,6 +14879,7 @@ impl Mp4Demuxer {
         track
             .into_iter()
             .map(|s| SampleInfo {
+                ordinal: s.seq,
                 offset: s.offset,
                 size: s.size,
                 decode_time: s.media_dts,

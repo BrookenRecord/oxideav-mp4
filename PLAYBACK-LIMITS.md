@@ -157,3 +157,21 @@ existing core `Error::ResourceExhausted` variant. Malformed structures and check
 wire arithmetic remain `InvalidData`; unsupported format features remain
 `Unsupported`. Invalid caller depth limits remain `InvalidData`. Callers can map
 these variants without inspecting diagnostic text. The workspace proof is unchanged.
+
+
+## Stable fragment-group sample ownership
+
+SampleInfo::ordinal exposes the existing zero-based expansion ordinal across all
+tracks in one reader. Fragment-group records expose first_sample_ordinal and
+sample_count for the actual contiguous samples emitted by that traf. Match the
+track and half-open ordinal range; mfhd sequence numbers and DTS are not unique
+ownership keys. Ordinals survive the reader's byte-offset sort and the selected
+accessor restores their expansion order. A new reader starts a new ordinal space.
+Zero-sample group records retain an empty range; existing duration-is-empty
+behavior is unchanged. Failed parsing exposes no partially built reader.
+
+No new sample vector or counter allocation is introduced. The accessor result
+includes one additional u64 per sample, so callers must use size_of::<SampleInfo>()
+when reserving it. The existing workspace entry_width already uses
+size_of::<TrafSampleGroupRecord>() and includes its two additional u64 fields
+through the same proven record-capacity allowance.

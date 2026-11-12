@@ -801,3 +801,6 @@ fn sample_count_matches_selected_index_across_tracks_and_fragments_without_io() 
     let empty = open(basic_init(), limits()).unwrap();
     assert_eq!(empty.sample_count(0), 0);
 }
+
+#[path = "ordinal_tests.rs"]
+mod ordinals;
