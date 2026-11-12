@@ -134,7 +134,11 @@ pub fn read_box_body<R: Read + ?Sized>(r: &mut R, h: &BoxHeader) -> Result<Vec<u
 pub fn skip_box_body<R: Seek + ?Sized>(r: &mut R, h: &BoxHeader) -> Result<()> {
     if let Some(payload) = h.payload_size() {
         if payload > 0 {
-            r.seek(SeekFrom::Current(payload as i64))?;
+            let end = r
+                .stream_position()?
+                .checked_add(payload)
+                .ok_or_else(|| Error::invalid("MP4: skipped box offset overflow"))?;
+            r.seek(SeekFrom::Start(end))?;
         }
     } else {
         // "rest of file" — seek to end.

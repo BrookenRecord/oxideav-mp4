@@ -43,11 +43,11 @@
 //! ```text
 //! FullBox('sgpd', version, 0)
 //! unsigned int(32) grouping_type
-//! if (version == 1) unsigned int(32) default_length
+//! if (version >= 1) unsigned int(32) default_length
 //! if (version >= 2) unsigned int(32) default_sample_description_index
 //! unsigned int(32) entry_count
 //! entry_count × {
-//!     if (version == 1 && default_length == 0)
+//!     if (version >= 1 && default_length == 0)
 //!         unsigned int(32) description_length
 //!     SampleGroupEntry(grouping_type)   // grouping-type-specific blob
 //! }
@@ -191,7 +191,7 @@ pub fn build_sgpd(s: &SampleGroupDescription) -> Vec<u8> {
     let common_len = entries_common_length(&s.entries);
     let want_v2 = s.default_sample_description_index.is_some() && common_len.is_some();
     let (version, default_length): (u8, u32) = if want_v2 {
-        (2, 0)
+        (2, common_len.unwrap() as u32)
     } else if let Some(cl) = common_len {
         (1, cl as u32)
     } else {
@@ -206,21 +206,22 @@ pub fn build_sgpd(s: &SampleGroupDescription) -> Vec<u8> {
     };
 
     // header sizing: 4 (full) + 4 (grouping_type)
-    //   + 4 (default_length if v1)
+    //   + 4 (default_length if v1 or v2)
     //   + 4 (default_sample_description_index if v2)
     //   + 4 (entry_count)
     //   + entries
     let extra = match version {
         1 => 4,
-        2 => 4,
+        2 => 8,
         _ => unreachable!(),
     };
     let mut body = Vec::with_capacity(4 + 4 + extra + 4 + entries_payload_len);
     body.push(version);
     body.extend_from_slice(&[0, 0, 0]); // flags
     body.extend_from_slice(&s.grouping_type);
+    body.extend_from_slice(&default_length.to_be_bytes());
     match version {
-        1 => body.extend_from_slice(&default_length.to_be_bytes()),
+        1 => {}
         2 => body.extend_from_slice(
             &s.default_sample_description_index
                 .unwrap_or(0)

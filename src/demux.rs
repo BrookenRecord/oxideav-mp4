@@ -8,7 +8,10 @@
 //!
 //! `next_packet` then serves them in order by seeking into the mdat.
 
+mod playback;
 mod video_config;
+
+pub use playback::OpenLimits;
 
 use std::collections::HashSet;
 use std::io::SeekFrom;
@@ -39,7 +42,39 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// fragment-local sample-group records a decrypting or indexing layer
 /// consumes). The `Box<dyn Demuxer>` form returned by [`open`] is what
 /// the registry uses.
-pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Mp4Demuxer> {
+pub fn open_typed(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Mp4Demuxer> {
+    open_with_plan(input, codecs, None)
+}
+
+/// Open one finite clear playback input with caller-selected allocation ceilings.
+/// The input must start at byte zero and remain unchanged across the preflight and
+/// parse passes. It may be a virtual init plus one HLS object, and is read/seeked
+/// through its entire bounded extent. No whole-source streaming guarantee is made.
+///
+/// Preserves all raw sample descriptions, headers/transforms, edits, clear sample
+/// groups, gapless and color/config evidence through the existing typed accessors.
+/// Skips non-playback item catalogues, hint metadata, seek/event indexes and rich per-track
+/// option-string summaries before their allocating handlers run. Protection,
+/// compressed headers, external references, invalid bounds/arithmetic and unsupported
+/// playback structures return core errors. The caller owns mdat-span validation,
+/// payload/accessor allocation accounting, source-edge trim and timeline authority.
+/// Reserve `limits.max_workspace_bytes` independently of the borrowed input window.
+/// Arbitrary allocations made by the caller's CodecResolver are outside this limit.
+/// Existing `open_typed` retains its historical rich-metadata behavior.
+pub fn open_playback_with_limits(
+    mut input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+    limits: OpenLimits,
+) -> Result<Mp4Demuxer> {
+    let plan = playback::preflight(&mut *input, limits)?;
+    open_with_plan(input, codecs, Some(plan))
+}
+
+fn open_with_plan(
+    mut input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+    plan: Option<playback::Plan>,
+) -> Result<Mp4Demuxer> {
     // Walk top-level boxes looking for ftyp + moov. Continue past moov
     // to pick up any movie fragments (`moof`+`mdat` pairs) that a
     // fragmented / DASH / HLS / Smooth Streaming MP4 emits after the
@@ -93,6 +128,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // fragment's earliest presentation time.
     let mut emsgs: Vec<EmsgRecord> = Vec::new();
     while let Some(hdr) = read_box_header(&mut *input)? {
+        if plan.is_some() && !matches!(hdr.fourcc, FTYP | MOOV | MOOF) {
+            skip_box_body(&mut *input, &hdr)?;
+            continue;
+        }
         match hdr.fourcc {
             FTYP => {
                 saw_ftyp = true;
@@ -110,7 +149,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                     Some(p) => {
                         let rest = p - if got { 4 } else { 0 };
                         if rest > 0 {
-                            input.seek(SeekFrom::Current(rest as i64))?;
+                            let end = input
+                                .stream_position()?
+                                .checked_add(rest)
+                                .ok_or_else(|| Error::invalid("MP4: ftyp skip offset overflow"))?;
+                            input.seek(SeekFrom::Start(end))?;
                         }
                     }
                     None => {
@@ -141,7 +184,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                 }
             }
             MOOV => {
-                moov = Some(read_box_body(&mut *input, &hdr)?);
+                moov = Some(read_bytes_vec(
+                    &mut *input,
+                    usize::try_from(
+                        hdr.payload_size()
+                            .ok_or_else(|| Error::invalid("MP4: open-ended moov"))?,
+                    )
+                    .map_err(|_| Error::invalid("MP4: moov size exceeds usize"))?,
+                )?);
             }
             // §8.16 — `styp` SegmentTypeBox (CMAF / DASH segment marker).
             // Same shape as ftyp; we just skip its payload.
@@ -259,7 +309,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // against the input size so a forged 32-bit count cannot drive a
     // multi-GiB allocation from a small file.
     let file_size = input.seek(std::io::SeekFrom::End(0))?;
-    let mut parsed = parse_moov(&moov, file_size)?;
+    let mut parsed = if plan.is_some() {
+        parse_moov_for_playback(&moov, file_size, true)?
+    } else {
+        parse_moov(&moov, file_size)?
+    };
     if parsed.tracks.is_empty() {
         return Err(Error::invalid("MP4: no tracks"));
     }
@@ -270,7 +324,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // `mvhd`, which may legitimately follow the `trak` boxes.
     let movie_timescale = parsed.movie_timescale;
     for t in &mut parsed.tracks {
-        t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale);
+        t.elst_timeline = build_elst_timeline(&t.elst, movie_timescale, t.timescale)?;
         fix_legacy_pcm_sample_sizes(t);
     }
     let parsed = parsed;
@@ -285,6 +339,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
 
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(parsed.tracks.len());
     let mut samples: Vec<SampleRef> = Vec::new();
+    if let Some(plan) = &plan {
+        samples
+            .try_reserve_exact(plan.samples)
+            .map_err(|_| Error::invalid("MP4: sample index allocation failed"))?;
+    }
     for (i, t) in parsed.tracks.iter().enumerate() {
         streams.push(build_stream_info(i as u32, t, codecs));
         expand_samples(t, i as u32, &mut samples)?;
@@ -296,7 +355,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut next_dts: Vec<i64> = vec![0; parsed.tracks.len()];
     for s in &samples {
         let idx = s.track_idx as usize;
-        let end = s.dts.saturating_add(s.duration);
+        let end = s
+            .dts
+            .checked_add(s.duration)
+            .ok_or_else(|| Error::invalid("MP4: decode time overflow"))?;
         if end > next_dts[idx] {
             next_dts[idx] = end;
         }
@@ -330,7 +392,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // input. The floor keeps degenerate-but-legal tiny files working.
     let mut sample_budget: u64 = {
         let end = input.seek(std::io::SeekFrom::End(0))?;
-        end.max(4096)
+        plan.as_ref().map_or(end.max(4096), |plan| {
+            plan.samples.saturating_sub(samples.len()) as u64
+        })
     };
     for moof in &moofs {
         let before = samples.len();
@@ -369,7 +433,29 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         moof_earliest.push(best);
     }
 
-    samples.sort_by_key(|s| s.offset);
+    if plan.is_some() {
+        for sample in &samples {
+            let track = &parsed.tracks[sample.track_idx as usize];
+            if sample.size == 0
+                || sample.duration <= 0
+                || sample.sdi == 0
+                || sample.sdi as usize > track.stsd_entries.len()
+            {
+                return Err(Error::invalid(
+                    "MP4: invalid playback sample description/size/duration",
+                ));
+            }
+            sample
+                .offset
+                .checked_add(sample.size as u64)
+                .ok_or_else(|| Error::invalid("MP4: sample range overflow"))?;
+        }
+    }
+    if plan.is_some() {
+        samples.sort_unstable_by_key(|s| s.offset);
+    } else {
+        samples.sort_by_key(|s| s.offset);
+    }
 
     // Movie duration from mvhd (§8.2.2), with §8.8.2 `mehd`
     // (MovieExtendsHeaderBox) as fall-back for fragmented files. When
@@ -386,7 +472,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .filter(|&d| d > 0)
         .unwrap_or(parsed.movie_duration);
     let duration_micros: i64 = if parsed.movie_timescale > 0 && effective_duration > 0 {
-        (effective_duration as i128 * 1_000_000 / parsed.movie_timescale as i128) as i64
+        i64::try_from(effective_duration as i128 * 1_000_000 / parsed.movie_timescale as i128)
+            .map_err(|_| Error::invalid("MP4: movie duration exceeds i64 microseconds"))?
     } else {
         0
     };
@@ -859,7 +946,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     }
 
     fill_params_from_samples(&mut streams, &parsed.tracks, &samples, &mut *input)?;
-    let gapless = gapless_timings(&parsed.tracks, &streams, &metadata, parsed.movie_timescale);
+    let gapless = gapless_timings(&parsed.tracks, &streams, &metadata, parsed.movie_timescale)?;
     // Flat mirror of the typed accessor, the way the `elst_*` keys
     // mirror `edit_list`.
     for (s, g) in streams.iter_mut().zip(&gapless) {
@@ -1670,6 +1757,7 @@ struct ParsedMoov {
 /// Per-track info collected from moov.
 #[derive(Clone, Debug)]
 struct Track {
+    playback: bool,
     /// `tkhd.track_ID` — 1-based track identifier, used to match
     /// fragmented `tfhd.track_ID` to a parsed track.
     track_id: u32,
@@ -1716,11 +1804,11 @@ struct Track {
     /// §8.6.1.3 ctts (CompositionOffsetBox). Run-length pairs of
     /// `(sample_count, sample_offset)` mapping decoding-order index
     /// to a composition-time offset (CTS = DTS + offset). Version 0
-    /// uses unsigned offsets, version 1 signed; we always store i32
+    /// uses unsigned offsets, version 1 signed; we widen both to i64
     /// so callers can apply it uniformly. Empty when the box is
     /// absent (every sample's CTS equals its DTS — no B-frames or
     /// the encoder didn't reorder).
-    ctts: Vec<(u32, i32)>,
+    ctts: Vec<(u32, i64)>,
     /// §8.6.6 edts/elst — full edit list. Each entry is
     /// `(segment_duration_movie_ts, media_time_track_ts, media_rate_q16)`.
     /// `media_time = -1` marks an empty edit (a "dwell" segment that
@@ -2971,7 +3059,7 @@ impl ElstTimeline {
         if !self.mapped || self.segments.is_empty() {
             // Legacy single-shift behaviour: subtract the first
             // non-empty edit's media_time.
-            return (self.leading_shift.saturating_neg(), true);
+            return (-self.leading_shift, true);
         }
         let first = &self.segments[0];
         if cts < first.media_start {
@@ -2980,7 +3068,7 @@ impl ElstTimeline {
             // samples ahead of an initial trim). Extrapolate the first
             // segment's delta so pre-roll timestamps stay ordered
             // (they land before the segment's presentation start).
-            return (first.pres_start.saturating_sub(first.media_start), false);
+            return (first.pres_start - first.media_start, false);
         }
         // Last segment whose media_start <= cts (media-monotonic list,
         // so this is the innermost candidate).
@@ -2993,8 +3081,8 @@ impl ElstTimeline {
             }
         }
         let s = &self.segments[chosen];
-        let delta = s.pres_start.saturating_sub(s.media_start);
-        let in_range = s.dur == 0 || cts < s.media_start.saturating_add(s.dur);
+        let delta = s.pres_start - s.media_start;
+        let in_range = s.dur == 0 || cts < s.media_start + s.dur;
         if in_range {
             (delta, true)
         } else {
@@ -3013,24 +3101,32 @@ impl ElstTimeline {
 ///
 /// `segment_duration` is expressed in the movie timescale (§8.6.6.3);
 /// each is rescaled to the track's media timescale here, with `u128`
-/// intermediate math (a v1 entry carries a 64-bit duration) saturating
-/// to `i64::MAX` rather than wrapping.
+/// intermediate math (a v1 entry carries a 64-bit duration). Unrepresentable
+/// durations, ranges, deltas and cumulative times return an error.
 fn build_elst_timeline(
     elst: &[ElstEntry],
     movie_timescale: u32,
     media_timescale: u32,
-) -> ElstTimeline {
+) -> Result<ElstTimeline> {
     let leading_shift = elst_leading_media_time(elst);
+    leading_shift
+        .checked_neg()
+        .ok_or_else(|| Error::invalid("MP4: edit shift overflow"))?;
     let mut segments: Vec<ElstMappedSegment> = Vec::new();
     let mut pres: i128 = 0;
     for e in elst {
         let dur_media: i64 = if movie_timescale > 0 {
-            let d = (e.segment_duration as u128).saturating_mul(media_timescale as u128)
-                / movie_timescale as u128;
-            i64::try_from(d).unwrap_or(i64::MAX)
+            let d =
+                (e.segment_duration as u128) * (media_timescale as u128) / movie_timescale as u128;
+            i64::try_from(d).map_err(|_| Error::invalid("MP4: edit duration overflow"))?
         } else {
             0
         };
+        pres = pres
+            .checked_add(dur_media as i128)
+            .filter(|value| *value <= i64::MAX as i128)
+            .ok_or_else(|| Error::invalid("MP4: edit presentation overflow"))?;
+        let pres_start = (pres - dur_media as i128) as i64;
         let rate_integer = (e.media_rate >> 16) as i16;
         if e.media_time == -1 || rate_integer == 0 {
             // Empty edit or dwell: presentation time advances, no
@@ -3038,32 +3134,36 @@ fn build_elst_timeline(
             // composition instant `media_time` — repeating a frame is
             // a renderer concern; at the container layer it inserts
             // presentation time exactly like an empty edit.)
-            pres = pres.saturating_add(dur_media as i128);
             continue;
         }
         segments.push(ElstMappedSegment {
-            pres_start: i64::try_from(pres).unwrap_or(i64::MAX),
+            pres_start,
             media_start: e.media_time,
             dur: dur_media,
         });
-        pres = pres.saturating_add(dur_media as i128);
+        pres_start
+            .checked_sub(e.media_time)
+            .ok_or_else(|| Error::invalid("MP4: edit delta overflow"))?;
+        e.media_time
+            .checked_add(dur_media)
+            .ok_or_else(|| Error::invalid("MP4: edit media range overflow"))?;
     }
     // Media-monotonicity: non-decreasing media_start AND
     // non-decreasing delta across successive segments (see type docs).
     let mut mapped = !segments.is_empty();
     for w in segments.windows(2) {
-        let d0 = w[0].pres_start.saturating_sub(w[0].media_start);
-        let d1 = w[1].pres_start.saturating_sub(w[1].media_start);
+        let d0 = w[0].pres_start - w[0].media_start;
+        let d1 = w[1].pres_start - w[1].media_start;
         if w[1].media_start < w[0].media_start || d1 < d0 {
             mapped = false;
             break;
         }
     }
-    ElstTimeline {
+    Ok(ElstTimeline {
         segments,
         leading_shift,
         mapped,
-    }
+    })
 }
 
 /// Per-track defaults from `mvex/trex` (ISO/IEC 14496-12 §8.8.3). All
@@ -3080,6 +3180,10 @@ struct TrexDefaults {
 }
 
 fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
+    parse_moov_for_playback(moov, file_size, false)
+}
+
+fn parse_moov_for_playback(moov: &[u8], file_size: u64, playback: bool) -> Result<ParsedMoov> {
     let mut out = ParsedMoov::default();
     let mut cur = std::io::Cursor::new(moov);
     let end = moov.len() as u64;
@@ -3090,10 +3194,19 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if playback && !matches!(hdr.fourcc, TRAK | MVHD | UDTA | META | MVEX) {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         match hdr.fourcc {
             TRAK => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                if let Some(t) = parse_trak(&body, file_size)? {
+                let track = if playback {
+                    parse_trak_for_playback(&body, file_size, true)?
+                } else {
+                    parse_trak(&body, file_size)?
+                };
+                if let Some(t) = track {
                     out.tracks.push(t);
                 }
             }
@@ -3118,6 +3231,7 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
                     &mut out.mehd_fragment_duration,
                     &mut out.leva,
                     &mut out.treps,
+                    playback,
                 )?;
             }
             PSSH => {
@@ -3170,6 +3284,7 @@ fn parse_mvex(
     mehd_fragment_duration: &mut Option<u64>,
     leva: &mut Option<LevaRecord>,
     treps: &mut Vec<TrepRecord>,
+    playback: bool,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
@@ -3179,6 +3294,10 @@ fn parse_mvex(
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if playback && !matches!(hdr.fourcc, TREX | MEHD) {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         match hdr.fourcc {
             TREX => {
                 let b = read_bytes_vec(&mut cur, psz)?;
@@ -5589,7 +5708,12 @@ pub fn parse_meco_box(body: &[u8]) -> MecoBox {
 }
 
 fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
+    parse_trak_for_playback(body, file_size, false)
+}
+
+fn parse_trak_for_playback(body: &[u8], file_size: u64, playback: bool) -> Result<Option<Track>> {
     let mut t = Track {
+        playback,
         track_id: 0,
         media_type: MediaType::Unknown,
         codec_id_fourcc: [0; 4],
@@ -5665,6 +5789,10 @@ fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if t.playback && !matches!(hdr.fourcc, TKHD | MDIA | EDTS) {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         match hdr.fourcc {
             TKHD => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
@@ -6689,60 +6817,102 @@ fn gapless_timings(
     streams: &[StreamInfo],
     metadata: &[(String, String)],
     movie_timescale: u32,
-) -> Vec<Option<GaplessTiming>> {
+) -> Result<Vec<Option<GaplessTiming>>> {
     let smpb = metadata
         .iter()
         .find(|(k, _)| k == "----:com.apple.iTunes:iTunSMPB")
         .and_then(|(_, v)| parse_itunsmpb(v));
     let first_audio = tracks.iter().position(|t| t.media_type == MediaType::Audio);
-    tracks
-        .iter()
-        .zip(streams)
-        .enumerate()
-        .map(|(i, (t, s))| {
-            if t.media_type != MediaType::Audio {
-                return None;
-            }
-            let entry_rate = t.sample_rate?;
-            let rate = s.params.sample_rate.unwrap_or(entry_rate);
-            if let (Some((priming, remainder, valid)), true) = (smpb, Some(i) == first_audio) {
-                let factor = match (entry_rate, rate) {
-                    (e, o) if e > 0 && o > e && o.is_multiple_of(e) => u64::from(o / e),
-                    _ => 1,
+    let mut result = Vec::with_capacity(tracks.len());
+    for (i, (track, stream)) in tracks.iter().zip(streams).enumerate() {
+        let Some(entry_rate) = track
+            .sample_rate
+            .filter(|_| track.media_type == MediaType::Audio)
+        else {
+            result.push(None);
+            continue;
+        };
+        let rate = stream.params.sample_rate.unwrap_or(entry_rate);
+        let evidence = if let (Some((priming, remainder, valid)), true) =
+            (smpb, Some(i) == first_audio)
+        {
+            let factor = if entry_rate > 0 && rate > entry_rate && rate.is_multiple_of(entry_rate) {
+                u64::from(rate / entry_rate)
+            } else {
+                1
+            };
+            Some(GaplessTiming {
+                priming: scale_gapless(priming, factor, 1)?,
+                valid: scale_gapless(valid, factor, 1)?,
+                remainder: scale_gapless(remainder, factor, 1)?,
+                source: GaplessSource::ITunSmpb,
+            })
+        } else if let [edit] = track.elst.as_slice() {
+            if track
+                .sgpd
+                .iter()
+                .any(|group| group.grouping_type == *b"roll")
+                && edit.media_time >= 0
+                && movie_timescale > 0
+            {
+                let scale = u64::from(track.timescale).max(1);
+                let priming = scale_gapless(edit.media_time as u64, u64::from(rate), scale)?;
+                let valid = scale_gapless(
+                    edit.segment_duration,
+                    u64::from(rate),
+                    u64::from(movie_timescale),
+                )?;
+                let total = match track.stts.first() {
+                    Some(&(_, frame)) => {
+                        let packets = track
+                            .stts
+                            .iter()
+                            .try_fold(0u64, |sum, &(count, _)| sum.checked_add(u64::from(count)))
+                            .ok_or_else(|| Error::invalid("MP4: gapless packet count overflow"))?;
+                        Some(
+                            packets.checked_mul(u64::from(frame)).ok_or_else(|| {
+                                Error::invalid("MP4: gapless coded count overflow")
+                            })?,
+                        )
+                    }
+                    None => track.duration,
                 };
-                return Some(GaplessTiming {
-                    priming: priming * factor,
-                    valid: valid * factor,
-                    remainder: remainder * factor,
-                    source: GaplessSource::ITunSmpb,
-                });
-            }
-            let rate = u64::from(rate);
-            let scale = u64::from(t.timescale).max(1);
-            let roll = t.sgpd.iter().any(|g| &g.grouping_type == b"roll");
-            match t.elst.as_slice() {
-                [e] if roll && e.media_time >= 0 && movie_timescale > 0 => {
-                    let priming = e.media_time as u64 * rate / scale;
-                    let valid = e.segment_duration * rate / u64::from(movie_timescale);
-                    // Every packet holds a full frame: the last one's
-                    // unused tail is the remainder too.
-                    let packets: u64 = t.stts.iter().map(|&(n, _)| u64::from(n)).sum();
-                    let total = match t.stts.first() {
-                        Some(&(_, frame)) => packets * u64::from(frame),
-                        None => t.duration?,
-                    } * rate
-                        / scale;
+                if let Some(total) = total {
+                    let total = scale_gapless(total, u64::from(rate), scale)?;
+                    let presented = priming
+                        .checked_add(valid)
+                        .ok_or_else(|| Error::invalid("MP4: gapless presented count overflow"))?;
+                    // A segment window need not contain the whole edit's media.
                     Some(GaplessTiming {
                         priming,
                         valid,
-                        remainder: total.saturating_sub(priming + valid),
+                        remainder: total.saturating_sub(presented),
                         source: GaplessSource::EditList,
                     })
+                } else {
+                    None
                 }
-                _ => None,
+            } else {
+                None
             }
-        })
-        .collect()
+        } else {
+            None
+        };
+        if let Some(evidence) = evidence {
+            evidence
+                .priming
+                .checked_add(evidence.valid)
+                .and_then(|sum| sum.checked_add(evidence.remainder))
+                .ok_or_else(|| Error::invalid("MP4: gapless total count overflow"))?;
+        }
+        result.push(evidence);
+    }
+    Ok(result)
+}
+
+fn scale_gapless(count: u64, rate: u64, scale: u64) -> Result<u64> {
+    u64::try_from(u128::from(count) * u128::from(rate) / u128::from(scale))
+        .map_err(|_| Error::invalid("MP4: gapless sample-rate conversion overflow"))
 }
 
 /// A track's header fields ([`Mp4Demuxer::track_header`]): `tkhd`
@@ -6958,6 +7128,10 @@ fn parse_mdia(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if t.playback && !matches!(hdr.fourcc, MDHD | HDLR | MINF | ELNG) {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         match hdr.fourcc {
             MDHD => {
                 let b = read_bytes_vec(&mut cur, psz)?;
@@ -7074,6 +7248,10 @@ fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if t.playback && !matches!(hdr.fourcc, STBL | VMHD) {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         match hdr.fourcc {
             STBL => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
@@ -7751,6 +7929,15 @@ fn parse_stbl(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
             None => break,
         };
         let psz = hdr.payload_size().unwrap_or(0) as usize;
+        if t.playback
+            && !matches!(
+                hdr.fourcc,
+                STSD | STTS | STSC | STSZ | STZ2 | STCO | CO64 | STSS | CTTS | SBGP | SGPD | CSGP
+            )
+        {
+            skip_cursor_bytes(&mut cur, psz);
+            continue;
+        }
         let b = read_bytes_vec(&mut cur, psz)?;
         match hdr.fourcc {
             STSD => parse_stsd(&b, t)?,
@@ -9319,11 +9506,11 @@ fn parse_sbgp(body: &[u8]) -> Result<SbgpBox> {
 /// interpretation to the layer that knows the `grouping_type` semantics.
 ///
 /// Entry sizing follows §8.9.3.2:
-/// * version 1 with `default_length > 0`: every entry is `default_length`
+/// * versions 1 and 2 with `default_length > 0`: every entry is `default_length`
 ///   bytes.
-/// * version 1 with `default_length == 0`: each entry is preceded by a
+/// * versions 1 and 2 with `default_length == 0`: each entry is preceded by a
 ///   `u32` `description_length`.
-/// * version 0 / version ≥ 2 with no per-entry length: the spec notes
+/// * version 0 with no per-entry length: the spec notes
 ///   version-0 entries carry no signalled size (§8.9.3.3 NOTE — their use
 ///   is deprecated precisely because they cannot be scanned). When the
 ///   box gives us no length to chunk by, we fall back to treating the
@@ -9344,7 +9531,7 @@ fn parse_sgpd(body: &[u8]) -> Result<SgpdBox> {
         read_u32(body, off).ok_or_else(|| Error::invalid("MP4: sgpd grouping_type truncated"))?;
     let grouping_type = grouping_type_raw.to_be_bytes();
     off += 4;
-    let default_length = if version == 1 {
+    let default_length = if version >= 1 {
         let dl = read_u32(body, off)
             .ok_or_else(|| Error::invalid("MP4: sgpd default_length truncated"))?;
         off += 4;
@@ -9366,7 +9553,7 @@ fn parse_sgpd(body: &[u8]) -> Result<SgpdBox> {
     off += 4;
 
     let mut entries: Vec<Vec<u8>> = Vec::new();
-    if version == 1 && default_length == 0 {
+    if version >= 1 && default_length == 0 {
         // Each entry prefixed with its own u32 description_length.
         for _ in 0..count {
             let len = read_u32(body, off)
@@ -9605,7 +9792,7 @@ pub fn parse_csgp(body: &[u8]) -> Result<CsgpBox> {
 ///   composition shift).
 ///
 /// We always return `i32` so callers can apply the offset uniformly.
-fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
+fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i64)>> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: ctts too short"));
     }
@@ -9619,15 +9806,10 @@ fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
         }
         let cnt = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
         let raw = [body[off + 4], body[off + 5], body[off + 6], body[off + 7]];
-        let dlt: i32 = if version == 0 {
-            // Spec says u32 here, but real-world v0 files routinely
-            // emit large unsigned values that exceed i32::MAX only
-            // when the timescale is itself huge — `as i32` preserves
-            // bit-pattern, and a sane v0 producer keeps the offset
-            // representable.
-            u32::from_be_bytes(raw) as i32
+        let dlt = if version == 0 {
+            i64::from(u32::from_be_bytes(raw))
         } else {
-            i32::from_be_bytes(raw)
+            i64::from(i32::from_be_bytes(raw))
         };
         out.push((cnt, dlt));
         off += 8;
@@ -10876,7 +11058,9 @@ fn parse_traf(
             moof_sequence,
             duration: state.default_sample_duration,
         });
-        next_dts[state.track_idx] = start.saturating_add(state.default_sample_duration as i64);
+        next_dts[state.track_idx] = start
+            .checked_add(state.default_sample_duration as i64)
+            .ok_or_else(|| Error::invalid("MP4: empty duration timestamp overflow"))?;
         return Ok(());
     }
 
@@ -11009,7 +11193,10 @@ fn parse_traf(
         let mut sample_off = if let Some(d) = parsed.data_offset {
             // i32 → wrap into u64 by sign-extending so a negative
             // offset (rare but legal) backs up into the moof.
-            (state.base_data_offset as i64).wrapping_add(d as i64) as u64
+            state
+                .base_data_offset
+                .checked_add_signed(i64::from(d))
+                .ok_or_else(|| Error::invalid("MP4: fragment data offset overflow"))?
         } else {
             next_data_offset_within_traf
         };
@@ -11030,14 +11217,20 @@ fn parse_traf(
                 }
             });
             let keyframe = (flags & SAMPLE_IS_NON_SYNC) == 0;
-            let cts_off = s.composition_time_offset.unwrap_or(0) as i64;
+            let cts_off = s.composition_time_offset.unwrap_or(0);
             // §8.6.6 edit-list mapping — same per-segment delta +
             // discard semantics as the moov sample-table path (the
             // elst lives in the moov and spans the fragments).
-            let media_cts = frag_dts.saturating_add(cts_off);
+            let media_cts = frag_dts
+                .checked_add(cts_off)
+                .ok_or_else(|| Error::invalid("MP4: composition timestamp overflow"))?;
             let (elst_delta, presented) = track.elst_timeline.delta_for_cts(media_cts);
-            let dts_v = frag_dts.saturating_add(elst_delta);
-            let cts_v = media_cts.saturating_add(elst_delta);
+            let dts_v = frag_dts
+                .checked_add(elst_delta)
+                .ok_or_else(|| Error::invalid("MP4: edited decode timestamp overflow"))?;
+            let cts_v = media_cts
+                .checked_add(elst_delta)
+                .ok_or_else(|| Error::invalid("MP4: edited composition timestamp overflow"))?;
 
             samples.push(SampleRef {
                 track_idx: state.track_idx as u32,
@@ -11054,8 +11247,12 @@ fn parse_traf(
                 seq: samples.len() as u64,
             });
 
-            sample_off = sample_off.saturating_add(size as u64);
-            frag_dts = frag_dts.saturating_add(dur);
+            sample_off = sample_off
+                .checked_add(size as u64)
+                .ok_or_else(|| Error::invalid("MP4: sample range overflow"))?;
+            frag_dts = frag_dts
+                .checked_add(dur)
+                .ok_or_else(|| Error::invalid("MP4: decode timestamp overflow"))?;
         }
         next_data_offset_within_traf = sample_off;
     }
@@ -11183,9 +11380,10 @@ fn parse_tfdt(body: &[u8]) -> Result<i64> {
         if body.len() < 12 {
             return Err(Error::invalid("MP4: tfdt v1 too short"));
         }
-        Ok(u64::from_be_bytes([
+        i64::try_from(u64::from_be_bytes([
             body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
-        ]) as i64)
+        ]))
+        .map_err(|_| Error::invalid("MP4: tfdt exceeds signed timestamp range"))
     } else {
         if body.len() < 8 {
             return Err(Error::invalid("MP4: tfdt v0 too short"));
@@ -11202,7 +11400,7 @@ struct TrunSample {
     duration: Option<u32>,
     size: Option<u32>,
     flags: Option<u32>,
-    composition_time_offset: Option<i32>,
+    composition_time_offset: Option<i64>,
 }
 
 #[derive(Default)]
@@ -11273,13 +11471,18 @@ fn parse_trun(body: &[u8], sample_budget: &mut u64) -> Result<ParsedTrun> {
         + ((flags & TRUN_SAMPLE_SIZE_PRESENT) != 0) as usize
         + ((flags & TRUN_SAMPLE_FLAGS_PRESENT) != 0) as usize
         + ((flags & TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT) != 0) as usize;
-    let needed = sample_count.saturating_mul(4 * per_sample_fields);
-    if off + needed > body.len() {
+    let needed = sample_count
+        .checked_mul(4 * per_sample_fields)
+        .and_then(|bytes| off.checked_add(bytes))
+        .ok_or_else(|| Error::invalid("MP4: trun table length overflow"))?;
+    if needed > body.len() {
         return Err(Error::invalid("MP4: trun samples truncated"));
     }
     // Both validations passed — charge the budget and reserve.
     *sample_budget -= sample_count as u64;
-    out.samples.reserve(sample_count);
+    out.samples
+        .try_reserve_exact(sample_count)
+        .map_err(|_| Error::invalid("MP4: trun allocation failed"))?;
 
     for _ in 0..sample_count {
         let mut s = TrunSample::default();
@@ -11312,14 +11515,13 @@ fn parse_trun(body: &[u8], sample_budget: &mut u64) -> Result<ParsedTrun> {
         }
         if flags & TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT != 0 {
             // v0: u32, v1: i32 (§8.8.8.2 — one shared 32-bit width,
-            // unsigned in v0 and signed in v1). We always store i32,
-            // preserving the bit pattern; a v0 value above i32::MAX
-            // (beyond any practical composition offset) wraps.
+            // unsigned in v0 and signed in v1). Widen before arithmetic
+            // so high unsigned v0 values remain positive.
             let raw = [body[off], body[off + 1], body[off + 2], body[off + 3]];
             let v = if version == 0 {
-                u32::from_be_bytes(raw) as i32
+                i64::from(u32::from_be_bytes(raw))
             } else {
-                i32::from_be_bytes(raw)
+                i64::from(i32::from_be_bytes(raw))
             };
             s.composition_time_offset = Some(v);
             off += 4;
@@ -12165,7 +12367,9 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
                     break;
                 }
                 pts.push((t_accum, delta as i64));
-                t_accum += delta as i64;
+                t_accum = t_accum
+                    .checked_add(delta as i64)
+                    .ok_or_else(|| Error::invalid("MP4: sample-table timestamp overflow"))?;
                 i += 1;
             }
         }
@@ -12188,7 +12392,7 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
                 if i >= n_samples {
                     break;
                 }
-                cts_offsets[i] = off as i64;
+                cts_offsets[i] = off;
                 i += 1;
             }
         }
@@ -12268,7 +12472,9 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         let chunk_start_sample = i - sample_within_chunk[i] as usize;
         let mut preceding: u64 = 0;
         for j in chunk_start_sample..i {
-            preceding += t.stsz[j] as u64;
+            preceding = preceding
+                .checked_add(t.stsz[j] as u64)
+                .ok_or_else(|| Error::invalid("MP4: sample offset overflow"))?;
         }
         let size = t.stsz[i];
         let (dts_v, dur) = pts[i];
@@ -12282,15 +12488,23 @@ fn expand_samples(t: &Track, track_idx: u32, out: &mut Vec<SampleRef>) -> Result
         // out), and media the list never presents is delivered with
         // the discard flag set. Tracks without an elst take the
         // identity mapping.
-        let media_cts = dts_v.saturating_add(cts_offsets[i]);
+        let media_cts = dts_v
+            .checked_add(cts_offsets[i])
+            .ok_or_else(|| Error::invalid("MP4: composition timestamp overflow"))?;
         let (elst_delta, presented) = t.elst_timeline.delta_for_cts(media_cts);
-        let cts_v = media_cts.saturating_add(elst_delta);
-        let dts_v_shifted = dts_v.saturating_add(elst_delta);
+        let cts_v = media_cts
+            .checked_add(elst_delta)
+            .ok_or_else(|| Error::invalid("MP4: edited composition timestamp overflow"))?;
+        let dts_v_shifted = dts_v
+            .checked_add(elst_delta)
+            .ok_or_else(|| Error::invalid("MP4: edited decode timestamp overflow"))?;
         let one_based = (i as u32) + 1;
         let keyframe = stss_all_keyframes || stss_set.contains(&one_based);
         out.push(SampleRef {
             track_idx,
-            offset: chunk_off + preceding,
+            offset: chunk_off
+                .checked_add(preceding)
+                .ok_or_else(|| Error::invalid("MP4: sample range overflow"))?,
             size,
             pts: cts_v,
             dts: dts_v_shifted,
@@ -12514,6 +12728,11 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
     {
         params.width = Some(w);
         params.height = Some(h);
+    }
+
+    if t.playback {
+        add_group_options(t, &mut params);
+        return finish_stream_info(index, t, params);
     }
 
     // ISO/IEC 14496-12 §8.12: when the track's sample entry was wrapped
@@ -13468,85 +13687,7 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         }
     }
 
-    // ISO/IEC 14496-12 §8.9.2/§8.9.3: surface sample groupings. Each
-    // `sbgp` (SampleToGroupBox) becomes one `sbgp_<n>` key (0-based
-    // encounter index) whose value is the grouping type, an optional
-    // `param=<P>` (v1 grouping_type_parameter), then the run-length
-    // `count:index` pairs (`group_description_index` 0 = "no group";
-    // ≥ 0x10001 = movie-fragment-local index, kept verbatim). Each
-    // `sgpd` (SampleGroupDescriptionBox) becomes one `sgpd_<n>` key
-    // whose value is the grouping type, an optional `default=<D>`
-    // (v2 default_sample_description_index), then the per-group entry
-    // payloads rendered as lowercase hex (grouping-type-specific blobs
-    // the container does not interpret). The two share `grouping_type`
-    // so a caller can pair an `sbgp_<n>` with the `sgpd_<m>` of the
-    // same type. Absent both boxes, none of the keys are emitted.
-    let render_grouping_type = |gt: &[u8; 4]| -> String {
-        std::str::from_utf8(gt)
-            .ok()
-            .filter(|s| s.chars().all(|c| !c.is_control()))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{:02x}{:02x}{:02x}{:02x}", gt[0], gt[1], gt[2], gt[3]))
-    };
-    for (i, sb) in t.sbgp.iter().enumerate() {
-        let mut v = render_grouping_type(&sb.grouping_type);
-        if let Some(p) = sb.grouping_type_parameter {
-            v.push_str(&format!(" param={}", p));
-        }
-        for (count, idx) in &sb.entries {
-            v.push_str(&format!(" {}:{}", count, idx));
-        }
-        params.options.insert(format!("sbgp_{}", i), v);
-    }
-    for (i, sg) in t.sgpd.iter().enumerate() {
-        let mut v = render_grouping_type(&sg.grouping_type);
-        if let Some(d) = sg.default_sample_description_index {
-            v.push_str(&format!(" default={}", d));
-        }
-        for entry in &sg.entries {
-            v.push(' ');
-            for byte in entry {
-                v.push_str(&format!("{:02x}", byte));
-            }
-        }
-        params.options.insert(format!("sgpd_{}", i), v);
-    }
-
-    // ISO/IEC 14496-12:2020 §8.9.5: surface CompactSampleToGroupBox
-    // (`csgp`) instances. Each becomes one `csgp_<n>` key whose value is
-    // the grouping type, an optional `param=<P>` (when the flag layout's
-    // grouping_type_parameter_present bit is set), then one
-    // space-separated token per pattern of the form
-    // `count*idx0,idx1,...,idxN` — `count` is the pattern's
-    // `sample_count` (how many times the index run replays) and the
-    // comma-list is the per-sample `sample_group_description_index`
-    // values of the pattern (0 = "no group"; fragment-local indices kept
-    // verbatim with their high bit set). Shares `grouping_type` with the
-    // matching `sgpd_<m>` exactly like `sbgp`. Absent `csgp`, no keys.
-    for (i, cg) in t.csgp.iter().enumerate() {
-        let mut v = render_grouping_type(&cg.grouping_type);
-        if let Some(p) = cg.grouping_type_parameter {
-            v.push_str(&format!(" param={}", p));
-        }
-        // §8.9.5 flag bit 7: when set, the high bit of each index is a
-        // fragment-local-vs-global source selector. Mark it so tooling
-        // reading the flat surface knows the indices need MSB resolution.
-        if cg.index_msb_indicates_fragment_local_description {
-            v.push_str(" fraglocal");
-        }
-        for pat in &cg.patterns {
-            v.push(' ');
-            v.push_str(&format!("{}*", pat.sample_count));
-            let idx_list = pat
-                .indices
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            v.push_str(&idx_list);
-        }
-        params.options.insert(format!("csgp_{}", i), v);
-    }
+    add_group_options(t, &mut params);
 
     // ISO/IEC 14496-12 §8.6.4: surface the optional SampleDependencyTypeBox
     // (`sdtp`) as a small summary on `params.options` rather than
@@ -13812,6 +13953,92 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
         params.options.insert(format!("saio_{}", i), v);
     }
 
+    finish_stream_info(index, t, params)
+}
+
+fn add_group_options(t: &Track, params: &mut CodecParameters) {
+    // ISO/IEC 14496-12 §8.9.2/§8.9.3: surface sample groupings. Each
+    // `sbgp` (SampleToGroupBox) becomes one `sbgp_<n>` key (0-based
+    // encounter index) whose value is the grouping type, an optional
+    // `param=<P>` (v1 grouping_type_parameter), then the run-length
+    // `count:index` pairs (`group_description_index` 0 = "no group";
+    // ≥ 0x10001 = movie-fragment-local index, kept verbatim). Each
+    // `sgpd` (SampleGroupDescriptionBox) becomes one `sgpd_<n>` key
+    // whose value is the grouping type, an optional `default=<D>`
+    // (v2 default_sample_description_index), then the per-group entry
+    // payloads rendered as lowercase hex (grouping-type-specific blobs
+    // the container does not interpret). The two share `grouping_type`
+    // so a caller can pair an `sbgp_<n>` with the `sgpd_<m>` of the
+    // same type. Absent both boxes, none of the keys are emitted.
+    let render_grouping_type = |gt: &[u8; 4]| -> String {
+        std::str::from_utf8(gt)
+            .ok()
+            .filter(|s| s.chars().all(|c| !c.is_control()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:02x}{:02x}{:02x}{:02x}", gt[0], gt[1], gt[2], gt[3]))
+    };
+    for (i, sb) in t.sbgp.iter().enumerate() {
+        let mut v = render_grouping_type(&sb.grouping_type);
+        if let Some(p) = sb.grouping_type_parameter {
+            v.push_str(&format!(" param={}", p));
+        }
+        for (count, idx) in &sb.entries {
+            v.push_str(&format!(" {}:{}", count, idx));
+        }
+        params.options.insert(format!("sbgp_{}", i), v);
+    }
+    for (i, sg) in t.sgpd.iter().enumerate() {
+        let mut v = render_grouping_type(&sg.grouping_type);
+        if let Some(d) = sg.default_sample_description_index {
+            v.push_str(&format!(" default={}", d));
+        }
+        for entry in &sg.entries {
+            v.push(' ');
+            for byte in entry {
+                v.push_str(&format!("{:02x}", byte));
+            }
+        }
+        params.options.insert(format!("sgpd_{}", i), v);
+    }
+
+    // ISO/IEC 14496-12:2020 §8.9.5: surface CompactSampleToGroupBox
+    // (`csgp`) instances. Each becomes one `csgp_<n>` key whose value is
+    // the grouping type, an optional `param=<P>` (when the flag layout's
+    // grouping_type_parameter_present bit is set), then one
+    // space-separated token per pattern of the form
+    // `count*idx0,idx1,...,idxN` — `count` is the pattern's
+    // `sample_count` (how many times the index run replays) and the
+    // comma-list is the per-sample `sample_group_description_index`
+    // values of the pattern (0 = "no group"; fragment-local indices kept
+    // verbatim with their high bit set). Shares `grouping_type` with the
+    // matching `sgpd_<m>` exactly like `sbgp`. Absent `csgp`, no keys.
+    for (i, cg) in t.csgp.iter().enumerate() {
+        let mut v = render_grouping_type(&cg.grouping_type);
+        if let Some(p) = cg.grouping_type_parameter {
+            v.push_str(&format!(" param={}", p));
+        }
+        // §8.9.5 flag bit 7: when set, the high bit of each index is a
+        // fragment-local-vs-global source selector. Mark it so tooling
+        // reading the flat surface knows the indices need MSB resolution.
+        if cg.index_msb_indicates_fragment_local_description {
+            v.push_str(" fraglocal");
+        }
+        for pat in &cg.patterns {
+            v.push(' ');
+            v.push_str(&format!("{}*", pat.sample_count));
+            let idx_list = pat
+                .indices
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            v.push_str(&idx_list);
+        }
+        params.options.insert(format!("csgp_{}", i), v);
+    }
+}
+
+fn finish_stream_info(index: u32, t: &Track, params: CodecParameters) -> StreamInfo {
     let timescale = if t.timescale == 0 { 1 } else { t.timescale };
     // §8.6.6: a mapped edit list places the track's first presented
     // sample at the first edit segment's presentation start (a leading
@@ -15537,9 +15764,27 @@ fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
     // grow the buffer to match, then surface a truncation as
     // `Error::invalid`.
     let mut buf = Vec::new();
-    r.take(n as u64).read_to_end(&mut buf)?;
-    if buf.len() != n {
-        return Err(Error::invalid("MP4: truncated box payload"));
+    let mut block = [0u8; 4096];
+    while buf.len() < n {
+        let want = (n - buf.len()).min(block.len());
+        let got = match r.read(&mut block[..want]) {
+            Ok(0) => return Err(Error::invalid("MP4: truncated box payload")),
+            Ok(got) => got,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let required = buf.len() + got;
+        if required > buf.capacity() {
+            let capacity = buf
+                .capacity()
+                .max(4096)
+                .saturating_mul(2)
+                .min(n)
+                .max(required);
+            buf.try_reserve_exact(capacity - buf.len())
+                .map_err(|_| Error::invalid("MP4: box allocation failed"))?;
+        }
+        buf.extend_from_slice(&block[..got]);
     }
     Ok(buf)
 }
@@ -15677,6 +15922,7 @@ mod tests {
 
     fn fresh_track() -> super::Track {
         super::Track {
+            playback: false,
             track_id: 0,
             media_type: oxideav_core::MediaType::Audio,
             codec_id_fourcc: [0; 4],
@@ -16442,7 +16688,7 @@ mod tests {
     /// No elst → identity mapping, everything presented.
     #[test]
     fn elst_timeline_identity_when_absent() {
-        let tl = super::build_elst_timeline(&[], 1000, 48_000);
+        let tl = super::build_elst_timeline(&[], 1000, 48_000).unwrap();
         assert_eq!(tl.delta_for_cts(0), (0, true));
         assert_eq!(tl.delta_for_cts(123_456), (0, true));
     }
@@ -16451,7 +16697,8 @@ mod tests {
     /// and composition times before it are decode pre-roll (discard).
     #[test]
     fn elst_timeline_initial_trim() {
-        let tl = super::build_elst_timeline(&[elst_entry(2000, 1024, RATE_1)], 1000, 48_000);
+        let tl =
+            super::build_elst_timeline(&[elst_entry(2000, 1024, RATE_1)], 1000, 48_000).unwrap();
         assert!(tl.mapped);
         assert_eq!(tl.delta_for_cts(1024), (-1024, true));
         assert_eq!(tl.delta_for_cts(5000), (-1024, true));
@@ -16466,7 +16713,7 @@ mod tests {
     #[test]
     fn elst_timeline_empty_edit_delay_rescales_movie_timescale() {
         let elst = [elst_entry(500, -1, RATE_1), elst_entry(3000, 100, RATE_1)];
-        let tl = super::build_elst_timeline(&elst, 1000, 48_000);
+        let tl = super::build_elst_timeline(&elst, 1000, 48_000).unwrap();
         assert!(tl.mapped);
         // delta = pres_start(24000) - media_time(100).
         assert_eq!(tl.delta_for_cts(100), (23_900, true));
@@ -16485,7 +16732,7 @@ mod tests {
             elst_entry(50, 100, RATE_0),
             elst_entry(100, 100, RATE_1),
         ];
-        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        let tl = super::build_elst_timeline(&elst, 1000, 1000).unwrap();
         assert!(tl.mapped);
         assert_eq!(tl.delta_for_cts(0), (0, true));
         assert_eq!(tl.delta_for_cts(99), (0, true));
@@ -16507,7 +16754,7 @@ mod tests {
             elst_entry(150, -1, RATE_1),
             elst_entry(100, 200, RATE_1),
         ];
-        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        let tl = super::build_elst_timeline(&elst, 1000, 1000).unwrap();
         assert!(tl.mapped);
         assert_eq!(tl.delta_for_cts(50), (0, true));
         // Interior gap: previous segment's delta, not presented.
@@ -16528,7 +16775,7 @@ mod tests {
         // [0,100), seg B media [200,300) → pres [100,200): delta drops
         // from 0 to -100 → fallback.
         let elst = [elst_entry(100, 0, RATE_1), elst_entry(100, 200, RATE_1)];
-        let tl = super::build_elst_timeline(&elst, 1000, 1000);
+        let tl = super::build_elst_timeline(&elst, 1000, 1000).unwrap();
         assert!(!tl.mapped);
         // Leading shift = first non-empty media_time = 0 → identity.
         assert_eq!(tl.delta_for_cts(150), (0, true));
@@ -16539,35 +16786,28 @@ mod tests {
     /// fragmented file: open-ended "from media_time onwards".
     #[test]
     fn elst_timeline_zero_duration_open_ended() {
-        let tl = super::build_elst_timeline(&[elst_entry(0, 20, RATE_1)], 1000, 1000);
+        let tl = super::build_elst_timeline(&[elst_entry(0, 20, RATE_1)], 1000, 1000).unwrap();
         assert!(tl.mapped);
         assert_eq!(tl.delta_for_cts(20), (-20, true));
         assert_eq!(tl.delta_for_cts(1_000_000), (-20, true));
         assert_eq!(tl.delta_for_cts(0), (-20, false)); // pre-roll
     }
 
-    /// Hostile v1 magnitudes: u64::MAX segment_duration must saturate,
-    /// not wrap or panic, through the movie→media rescale and the
-    /// presentation accumulator.
+    /// Unrepresentable v1 edit durations return an error rather than altered timing.
     #[test]
-    fn elst_timeline_saturates_on_giant_durations() {
+    fn elst_timeline_rejects_giant_durations() {
         let elst = [
             elst_entry(u64::MAX, -1, RATE_1),
             elst_entry(u64::MAX, 10, RATE_1),
         ];
-        let tl = super::build_elst_timeline(&elst, 1, 48_000);
-        // Must not panic; the mapped delta saturates.
-        let (d, _) = tl.delta_for_cts(10);
-        assert!(d >= 0, "saturated positive delta, got {d}");
-        let _ = tl.delta_for_cts(i64::MAX);
-        let _ = tl.delta_for_cts(i64::MIN);
+        assert!(super::build_elst_timeline(&elst, 1, 48_000).is_err());
     }
 
     /// A zero movie timescale (malformed mvhd) must not divide by zero;
     /// all durations collapse to 0 (open-ended first segment wins).
     #[test]
     fn elst_timeline_zero_movie_timescale() {
-        let tl = super::build_elst_timeline(&[elst_entry(1000, 30, RATE_1)], 0, 48_000);
+        let tl = super::build_elst_timeline(&[elst_entry(1000, 30, RATE_1)], 0, 48_000).unwrap();
         assert_eq!(tl.delta_for_cts(30), (-30, true));
         assert_eq!(tl.delta_for_cts(29), (-30, false));
     }
@@ -16576,7 +16816,7 @@ mod tests {
     /// never be empty) degrades to the leading-shift fallback.
     #[test]
     fn elst_timeline_all_empty_list_falls_back() {
-        let tl = super::build_elst_timeline(&[elst_entry(100, -1, RATE_1)], 1000, 1000);
+        let tl = super::build_elst_timeline(&[elst_entry(100, -1, RATE_1)], 1000, 1000).unwrap();
         assert!(!tl.mapped);
         assert_eq!(tl.delta_for_cts(0), (0, true));
     }
@@ -20546,6 +20786,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&[2u8, 0, 0, 0]); // version 2 + flags 0
         body.extend_from_slice(b"alst"); // grouping_type
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_length
         body.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
         body.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
         let sg = super::parse_sgpd(&body).unwrap();

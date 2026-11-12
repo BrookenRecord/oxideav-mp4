@@ -196,14 +196,8 @@ fn sgpd_v2_with_default_sample_description_index_roundtrips() {
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     let opts = &dmx.streams()[0].params.options;
-    // Demuxer renders the v2 default as `default=<D>`. The container
-    // layer cannot recover per-entry boundaries from v2 alone (entry
-    // length is grouping-type-specific, not signalled in the box) so
-    // it folds all entry bytes into one combined blob — the
-    // grouping-type-aware caller would re-split, in this case at 2
-    // bytes per entry. We assert the combined-blob shape because
-    // that's what the demuxer surfaces today.
-    assert_eq!(opts.get("sgpd_0"), Some("alst default=2 cafebeef"));
+    // v2 carries default_length before the default index, preserving entry boundaries.
+    assert_eq!(opts.get("sgpd_0"), Some("alst default=2 cafe beef"));
     assert_eq!(opts.get("sbgp_0"), Some("alst 4:1"));
 }
 
