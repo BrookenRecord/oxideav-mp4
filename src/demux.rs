@@ -342,7 +342,7 @@ fn open_with_plan(
     if let Some(plan) = &plan {
         samples
             .try_reserve_exact(plan.samples)
-            .map_err(|_| Error::invalid("MP4: sample index allocation failed"))?;
+            .map_err(|_| Error::resource_exhausted("MP4: sample index allocation failed"))?;
     }
     for (i, t) in parsed.tracks.iter().enumerate() {
         streams.push(build_stream_info(i as u32, t, codecs));
@@ -11482,7 +11482,7 @@ fn parse_trun(body: &[u8], sample_budget: &mut u64) -> Result<ParsedTrun> {
     *sample_budget -= sample_count as u64;
     out.samples
         .try_reserve_exact(sample_count)
-        .map_err(|_| Error::invalid("MP4: trun allocation failed"))?;
+        .map_err(|_| Error::resource_exhausted("MP4: trun allocation failed"))?;
 
     for _ in 0..sample_count {
         let mut s = TrunSample::default();
@@ -14828,6 +14828,17 @@ impl Mp4Demuxer {
         })
     }
 
+    /// Number of samples returned by [`Self::samples`] for this stream, or zero
+    /// for an unknown stream. Scans all samples in this finite input window in
+    /// linear time, without allocation, I/O, sorting or reader mutation. Call this
+    /// before reserving memory for the allocating `samples` accessor.
+    pub fn sample_count(&self, stream_index: u32) -> usize {
+        self.samples
+            .iter()
+            .filter(|sample| sample.track_idx == stream_index)
+            .count()
+    }
+
     /// The stream's samples in decode order: its sample table, then its
     /// movie fragments in file order. Times are on the media timeline;
     /// [`Self::edit_list`] maps them onto the presentation.
@@ -15782,7 +15793,7 @@ fn read_bytes_vec<R: Read + ?Sized>(r: &mut R, n: usize) -> Result<Vec<u8>> {
                 .min(n)
                 .max(required);
             buf.try_reserve_exact(capacity - buf.len())
-                .map_err(|_| Error::invalid("MP4: box allocation failed"))?;
+                .map_err(|_| Error::resource_exhausted("MP4: box allocation failed"))?;
         }
         buf.extend_from_slice(&block[..got]);
     }

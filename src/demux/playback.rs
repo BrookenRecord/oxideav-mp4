@@ -10,6 +10,8 @@ use std::mem::size_of;
 /// allocations. max_depth must be 1..=32. Limits apply to one immutable seekable
 /// input window and opening the reader, not later caller-owned accessor results,
 /// packet payloads, input storage or arbitrary CodecResolver allocations.
+/// Configured ceiling refusals return `Error::ResourceExhausted`; invalid limit
+/// arguments and malformed input return `Error::InvalidData`.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenLimits {
     /// Aggregate resident stsz/stz2 and fragmented trun sample count.
@@ -58,7 +60,7 @@ impl Stats {
     fn entries(&mut self, count: usize, limits: OpenLimits) -> Result<()> {
         self.entries = add(self.entries, count)?;
         if self.entries > limits.max_table_entries {
-            return Err(Error::invalid("MP4: playback table-entry limit"));
+            return Err(Error::resource_exhausted("MP4: playback table-entry limit"));
         }
         Ok(())
     }
@@ -66,7 +68,7 @@ impl Stats {
     fn samples(&mut self, count: usize, limits: OpenLimits) -> Result<()> {
         self.samples = add(self.samples, count)?;
         if self.samples > limits.max_samples {
-            return Err(Error::invalid("MP4: playback sample limit"));
+            return Err(Error::resource_exhausted("MP4: playback sample limit"));
         }
         self.entries(count, limits)
     }
@@ -161,13 +163,16 @@ pub(super) fn preflight(input: &mut dyn ReadSeek, limits: OpenLimits) -> Result<
             if stats.metadata > limits.max_metadata_bytes
                 || add(length, 4096)? > limits.max_workspace_bytes
             {
-                return Err(Error::invalid("MP4: playback metadata byte limit"));
+                return Err(Error::resource_exhausted(
+                    "MP4: playback metadata byte limit",
+                ));
             }
             // This preflight owns no prior body. Allocate once after proving the
             // complete extent and cap; geometric growth could overlap allocations.
             let mut body = Vec::new();
-            body.try_reserve_exact(length)
-                .map_err(|_| Error::invalid("MP4: playback preflight allocation failed"))?;
+            body.try_reserve_exact(length).map_err(|_| {
+                Error::resource_exhausted("MP4: playback preflight allocation failed")
+            })?;
             body.resize(length, 0);
             input.read_exact(&mut body)?;
             preflight::walk(&body, header.fourcc, 1, None, &mut stats, limits)?;
@@ -175,7 +180,7 @@ pub(super) fn preflight(input: &mut dyn ReadSeek, limits: OpenLimits) -> Result<
         input.seek(SeekFrom::Start(next))?;
     }
     if stats.workspace()? > limits.max_workspace_bytes {
-        return Err(Error::invalid("MP4: playback workspace limit"));
+        return Err(Error::resource_exhausted("MP4: playback workspace limit"));
     }
     input.seek(SeekFrom::Start(0))?;
     Ok(Plan {

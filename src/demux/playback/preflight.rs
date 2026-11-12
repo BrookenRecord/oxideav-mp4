@@ -110,7 +110,7 @@ pub(super) fn walk(
     limits: OpenLimits,
 ) -> Result<()> {
     if depth > limits.max_depth {
-        return Err(Error::invalid("MP4: playback depth limit"));
+        return Err(Error::resource_exhausted("MP4: playback depth limit"));
     }
     stats.depth = stats.depth.max(depth);
     while let Some((kind, body)) = next(&mut bytes)? {
@@ -163,7 +163,7 @@ pub(super) fn walk(
             TRAK if parent == MOOV => {
                 stats.tracks = add(stats.tracks, 1)?;
                 if stats.tracks > limits.max_tracks {
-                    return Err(Error::invalid("MP4: playback track limit"));
+                    return Err(Error::resource_exhausted("MP4: playback track limit"));
                 }
                 walk(
                     body,
@@ -208,7 +208,7 @@ pub(super) fn walk(
                 let count = u32_at(body, 4)? as usize;
                 stats.descriptions = add(stats.descriptions, count)?;
                 if stats.descriptions > limits.max_sample_descriptions {
-                    return Err(Error::invalid("MP4: playback description limit"));
+                    return Err(Error::resource_exhausted("MP4: playback description limit"));
                 }
                 stats.entries(count, limits)?;
                 let mut entries = &body[8..];
@@ -369,7 +369,7 @@ fn entry_children(
     limits: OpenLimits,
 ) -> Result<()> {
     if depth > limits.max_depth {
-        return Err(Error::invalid("MP4: playback entry depth limit"));
+        return Err(Error::resource_exhausted("MP4: playback entry depth limit"));
     }
     stats.depth = stats.depth.max(depth);
     while !bytes.is_empty() {

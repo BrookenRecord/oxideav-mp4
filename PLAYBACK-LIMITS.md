@@ -141,3 +141,19 @@ Bounded SBGP/SGPD preflight validates complete versioned entry ranges before the
 legacy fragment walker. Fixed and variable v1/v2 entries and fixed-size v0
 roll/prol evidence cannot be silently dropped on parse errors. Ordinary tolerant
 fragment behavior is preserved through the existing open_typed entry.
+
+
+## Accessor admission and typed refusals
+
+`sample_count(stream_index)` returns the exact count for `samples(stream_index)`
+without allocation, I/O, sorting or mutation. Its linear scan visits all samples
+in this finite input. Unknown streams return zero. The allocating accessor first
+filters references by stream, so its temporary reference vector, stable-sort
+scratch and result scale with the selected count, independently of other tracks.
+The reader's existing all-track sample index remains covered by opening workspace.
+
+Configured playback ceiling refusals and fallible allocation failures use the
+existing core `Error::ResourceExhausted` variant. Malformed structures and checked
+wire arithmetic remain `InvalidData`; unsupported format features remain
+`Unsupported`. Invalid caller depth limits remain `InvalidData`. Callers can map
+these variants without inspecting diagnostic text. The workspace proof is unchanged.

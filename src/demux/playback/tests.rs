@@ -184,12 +184,11 @@ fn playback_limits_reject_each_aggregate_ceiling() {
             max_depth: 1,
             ..limits()
         },
-        OpenLimits {
-            max_depth: 0,
-            ..limits()
-        },
     ] {
-        assert!(open(bytes.clone(), selected).is_err());
+        assert!(matches!(
+            open(bytes.clone(), selected),
+            Err(Error::ResourceExhausted(_))
+        ));
     }
 }
 
@@ -713,4 +712,92 @@ fn playback_stsc_admits_a_positive_bounded_run() {
     .unwrap();
     assert_eq!(reader.samples(0).len(), 1);
     assert_eq!(reader.samples(0)[0].duration, 3000);
+}
+
+#[test]
+fn playback_error_variants_distinguish_limits_malformed_and_unsupported() {
+    for max_depth in [0, 33] {
+        assert!(matches!(
+            open(
+                window(0, 0, &[0]),
+                OpenLimits {
+                    max_depth,
+                    ..limits()
+                }
+            ),
+            Err(Error::InvalidData(_))
+        ));
+    }
+    assert!(matches!(
+        open(window(u64::MAX, 0, &[0]), limits()),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        open(boxed(b"moov", &[0, 0, 0]), limits()),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        open(boxed(b"senc", &[0; 8]), limits()),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn sample_count_matches_selected_index_across_tracks_and_fragments_without_io() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Observed {
+        bytes: Cursor<Vec<u8>>,
+        operations: Arc<AtomicUsize>,
+    }
+    impl std::io::Read for Observed {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            std::io::Read::read(&mut self.bytes, output)
+        }
+    }
+    impl std::io::Seek for Observed {
+        fn seek(&mut self, offset: SeekFrom) -> std::io::Result<u64> {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            self.bytes.seek(offset)
+        }
+    }
+    let tracks = [
+        track(1, &[description(100, &[])], &[], &[]),
+        track(2, &[description(100, &[])], &[], &[]),
+    ];
+    let bytes = joined(&[
+        init(&tracks, &[]),
+        fragment_with(
+            &[
+                traf(1, 0x020000, None, 0, 0, &[0, 0], &[]),
+                traf(2, 0x020000, None, 0, 0, &[0], &[]),
+            ],
+            &[],
+        ),
+        basic_fragment(6000, 0, &[0]),
+    ]);
+    let operations = Arc::new(AtomicUsize::new(0));
+    let input = Observed {
+        bytes: Cursor::new(bytes),
+        operations: operations.clone(),
+    };
+    let reader = open_playback_with_limits(Box::new(input), &NullCodecResolver, limits()).unwrap();
+    let before = operations.load(Ordering::Relaxed);
+    for _ in 0..4 {
+        assert_eq!(reader.sample_count(0), 3);
+        assert_eq!(reader.sample_count(1), 1);
+        assert_eq!(reader.sample_count(2), 0);
+        assert_eq!(reader.sample_count(u32::MAX), 0);
+    }
+    assert_eq!(operations.load(Ordering::Relaxed), before);
+    for index in 0..=2 {
+        assert_eq!(reader.sample_count(index), reader.samples(index).len());
+    }
+    assert_eq!(reader.cursor, 0);
+    assert_eq!(reader.sample_count(0), 3);
+    let empty = open(basic_init(), limits()).unwrap();
+    assert_eq!(empty.sample_count(0), 0);
 }
