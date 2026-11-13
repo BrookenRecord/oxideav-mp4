@@ -37,7 +37,8 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         b"ulaw" => "pcm_mulaw",
         b"alaw" => "pcm_alaw",
         b"avc1" | b"avc3" => "h264",
-        b"hvc1" | b"hev1" => "h265",
+        // Recognize the HEVC base codec without interpreting or qualifying Dolby metadata.
+        b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => "h265",
         b"vp08" => "vp8",
         b"vp09" => "vp9",
         b"av01" => "av1",
@@ -165,6 +166,14 @@ pub fn from_sample_entry_with_oti(fourcc: &[u8; 4], oti: u8) -> CodecId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hevc_visual_entries_identify_only_the_base_codec() {
+        for tag in [b"hvc1", b"hev1", b"dvh1", b"dvhe"] {
+            assert_eq!(from_sample_entry(tag), CodecId::new("h265"));
+            assert_eq!(from_sample_entry_with_oti(tag, 0x6a), CodecId::new("h265"));
+        }
+    }
 
     #[test]
     fn mp4a_default_is_aac() {

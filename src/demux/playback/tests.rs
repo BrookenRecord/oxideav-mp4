@@ -802,5 +802,148 @@ fn sample_count_matches_selected_index_across_tracks_and_fragments_without_io() 
     assert_eq!(empty.sample_count(0), 0);
 }
 
+// Independently authored container bytes: no Dolby record interpretation or
+// decoder qualification is implied by these opaque configuration children.
+fn hevc_visual_entry(tag: &[u8; 4], extra: &[u8]) -> Vec<u8> {
+    let mut body = vec![0; 78];
+    body[6..8].copy_from_slice(&1u16.to_be_bytes());
+    body[24..26].copy_from_slice(&640u16.to_be_bytes());
+    body[26..28].copy_from_slice(&360u16.to_be_bytes());
+    let hvcc = [
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 0xf0, 0, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 0,
+    ];
+    body.extend(boxed(b"hvcC", &hvcc));
+    body.extend(boxed(b"dvcC", &[0xa5, 0x5a, 0x17, 0xe3]));
+    body.extend_from_slice(extra);
+    boxed(tag, &body)
+}
+
+fn hevc_visual_window(entry: Vec<u8>) -> Vec<u8> {
+    let mut fragment = basic_fragment(17, 1, &[(-2i32) as u32]);
+    let at = fragment
+        .windows(4)
+        .position(|part| part == b"trun")
+        .unwrap()
+        + 12;
+    let offset = fragment.len() as u32 + 8;
+    fragment[at..at + 4].copy_from_slice(&offset.to_be_bytes());
+    joined(&[
+        init(&[track(1, &[entry], &[], &[])], &[]),
+        fragment,
+        boxed(b"mdat", &[0x00, 0x00, 0x01, 0x26]),
+    ])
+}
+
+#[test]
+fn playback_hevc_visual_entries_preserve_bytes_and_reader_semantics() {
+    for tag in [b"dvh1", b"dvhe"] {
+        let entry = hevc_visual_entry(tag, &[]);
+        let bytes = hevc_visual_window(entry.clone());
+        let mut bounded = open(bytes.clone(), limits()).unwrap();
+        let mut ordinary = open_typed(Box::new(Cursor::new(bytes)), &NullCodecResolver).unwrap();
+        assert_eq!(bounded.streams()[0].params.codec_id.as_str(), "h265");
+        assert_eq!(ordinary.streams()[0].params.codec_id.as_str(), "h265");
+        assert_eq!(bounded.streams()[0].params.extradata, entry[94..117]);
+        assert_eq!(
+            bounded.streams()[0].params.extradata,
+            ordinary.streams()[0].params.extradata
+        );
+        let raw = bounded.sample_entry(0, 1).unwrap();
+        assert_eq!(raw.format, *tag);
+        assert_eq!(raw.payload, &entry[8..]);
+        assert_eq!(raw.data_reference_index, 1);
+        assert_eq!(Some(raw), ordinary.sample_entry(0, 1));
+        assert_eq!(bounded.samples(0), ordinary.samples(0));
+        let sample = bounded.samples(0)[0];
+        assert_eq!(sample.ordinal, 0);
+        assert_eq!(sample.sample_description_index, 1);
+        assert_eq!(sample.decode_time, 17);
+        assert_eq!(sample.composition_time, 15);
+        assert_eq!(sample.duration, 3000);
+        assert_eq!(sample.size, 4);
+        assert_eq!(bounded.sample_count(0), 1);
+        let packet = bounded.next_packet().unwrap();
+        let normal_packet = ordinary.next_packet().unwrap();
+        assert_eq!(packet.data, [0x00, 0x00, 0x01, 0x26]);
+        assert_eq!(packet.data, normal_packet.data);
+        assert_eq!(packet.dts, Some(17));
+        assert_eq!(packet.pts, Some(15));
+        assert_eq!(packet.duration, Some(3000));
+        assert_eq!(packet.dts, normal_packet.dts);
+        assert_eq!(packet.pts, normal_packet.pts);
+        assert_eq!(packet.duration, normal_packet.duration);
+        assert!(matches!(bounded.next_packet(), Err(Error::Eof)));
+    }
+}
+
+#[test]
+fn playback_hevc_visual_entries_keep_malformed_and_handler_checks() {
+    for tag in [b"dvh1", b"dvhe"] {
+        let mut short = vec![0; 77];
+        short[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let malformed = [u32::MAX.to_be_bytes().as_slice(), b"hvcC"].concat();
+        for entry in [boxed(tag, &short), hevc_visual_entry(tag, &malformed)] {
+            assert!(matches!(
+                open(hevc_visual_window(entry), limits()),
+                Err(Error::InvalidData(_))
+            ));
+        }
+        let bytes = hevc_visual_window(hevc_visual_entry(tag, &[]));
+        assert!(matches!(
+            open(bytes[..bytes.len() - 1].to_vec(), limits()),
+            Err(Error::InvalidData(_))
+        ));
+        let mut wrong = track(1, &[hevc_visual_entry(tag, &[])], &[], &[]);
+        let at = wrong.windows(4).position(|part| part == b"vide").unwrap();
+        wrong[at..at + 4].copy_from_slice(b"soun");
+        assert!(matches!(
+            open(init(&[wrong], &[]), limits()),
+            Err(Error::InvalidData(_))
+        ));
+    }
+}
+
+#[test]
+fn playback_hevc_visual_entries_keep_unsupported_boundaries() {
+    for tag in [b"dvh1", b"dvhe"] {
+        let mut external = hevc_visual_entry(tag, &[]);
+        external[14..16].copy_from_slice(&2u16.to_be_bytes());
+        for entry in [external, hevc_visual_entry(tag, &boxed(b"sinf", &[]))] {
+            assert!(matches!(
+                open(hevc_visual_window(entry), limits()),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+    for tag in [b"encv", b"dvh2", b"dvh0", b"dvhE"] {
+        assert!(matches!(
+            open(hevc_visual_window(hevc_visual_entry(tag, &[])), limits()),
+            Err(Error::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn playback_hevc_visual_entries_keep_metadata_and_workspace_limits() {
+    for tag in [b"dvh1", b"dvhe"] {
+        let bytes = hevc_visual_window(hevc_visual_entry(tag, &[]));
+        for selected in [
+            OpenLimits {
+                max_metadata_bytes: 1,
+                ..limits()
+            },
+            OpenLimits {
+                max_workspace_bytes: 1,
+                ..limits()
+            },
+        ] {
+            assert!(matches!(
+                open(bytes.clone(), selected),
+                Err(Error::ResourceExhausted(_))
+            ));
+        }
+    }
+}
+
 #[path = "ordinal_tests.rs"]
 mod ordinals;

@@ -216,9 +216,8 @@ pub(super) fn walk(
                     let (kind, entry) = next(&mut entries)?
                         .ok_or_else(|| Error::invalid("MP4: missing playback sample entry"))?;
                     let family = match &kind {
-                        b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"av01" | b"vp09" | b"mp4v" => {
-                            MediaType::Video
-                        }
+                        b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" | b"av01"
+                        | b"vp09" | b"mp4v" => MediaType::Video,
                         b"mp4a" | b"ac-3" | b"ec-3" | b"Opus" | b"fLaC" | b"alac" | b"sowt"
                         | b"twos" => MediaType::Audio,
                         _ => {
